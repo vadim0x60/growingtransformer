@@ -1,0 +1,1 @@
+{"step": 100, "split": "valid", "architecture": [2, 2], "bpc": 3.811347260978998, "tokens": 4999999, "full": true, "ablation_delta_bpc": {"without_heads": 0.0006155235507590007, "without_layer": 0.018146489598529048, "without_both": 0.020048025736227437}}

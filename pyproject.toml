@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "growing-transformer"
+version = "0.1.0"
+description = "Independently growing transformer heads and layers"
+requires-python = ">=3.11"
+dependencies = ["torch>=2.2", "numpy>=1.26"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = ["growing_transformer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

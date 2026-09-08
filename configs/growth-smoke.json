@@ -1,0 +1,13 @@
+{
+  "model": {"d_model": 32, "head_dim": 8, "ff_mult": 2, "context": 64, "max_heads": 4, "max_layers": 4},
+  "output": "runs/growth-smoke",
+  "steps": 12,
+  "batch_size": 4,
+  "growth_interval": 4,
+  "growth_warmup": 4,
+  "growth_threshold": 0.09,
+  "log_interval": 4,
+  "eval_interval": 4,
+  "eval_batches": 2,
+  "checkpoint_interval": 4
+}

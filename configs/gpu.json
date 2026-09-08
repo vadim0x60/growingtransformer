@@ -1,0 +1,17 @@
+{
+  "model": {"d_model": 128, "head_dim": 32, "ff_mult": 4, "context": 256, "max_heads": 8, "max_layers": 8},
+  "output": "runs/gpu-adaptive",
+  "device": "cuda",
+  "steps": 100000,
+  "batch_size": 32,
+  "lr": 0.0003,
+  "penalty": 0.01,
+  "growth_interval": 1000,
+  "growth_warmup": 1000,
+  "growth_threshold": 0.5,
+  "ema_decay": 0.95,
+  "log_interval": 100,
+  "eval_interval": 1000,
+  "eval_batches": 20,
+  "checkpoint_interval": 1000
+}
