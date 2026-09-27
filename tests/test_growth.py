@@ -1,6 +1,8 @@
 import importlib
 import json
 import math
+from pathlib import Path
+import time
 
 import numpy as np
 import pytest
@@ -230,16 +232,71 @@ def test_trainer_checks_every_n_steps_and_avoids_test_split(tmp_path, monkeypatc
     monkeypatch.setattr(trainer, "load_split", data)
     config = TrainConfig(model=small(max_heads=4, max_layers=4), output=str(tmp_path),
                          steps=4, batch_size=2, growth_interval=2, growth_warmup=2,
-                         growth_threshold=0.09, eval_batches=1)
+                         growth_threshold=0.09, eval_batches=1, log_interval=3)
     model = trainer.train(config)
     records = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
     assert [r["step"] for r in records if r["kind"] == "growth_check"] == [2, 4]
+    steps = [r for r in records if r["kind"] == "train"]
+    assert [r["step"] for r in steps] == [1, 2, 3, 4]
+    assert [r["architecture"] for r in steps] == [[2, 2], [2, 2], [3, 3, 2], [3, 3, 2]]
+    assert [r["tokens_seen"] for r in steps] == [16, 32, 48, 64]
+    for record in steps:
+        assert record["bpc"] == pytest.approx(record["ce"] / math.log(2))
+        assert record["loss"] == pytest.approx(record["ce"] + 0.01 * record["penalty_unscaled"])
+        assert record["gradient_norm_before_clip"] > 0
+        assert 0 <= record["accuracy"] <= 1
+    diagnostics = [r for r in records if r["kind"] == "diagnostics"]
+    assert [r["step"] for r in diagnostics] == [3, 4]
+    assert "layers.2.heads.1.out.weight" in diagnostics[0]["parameter_norms_before_update"]
+    assert "layers.3.heads.0.out.weight" not in diagnostics[1]["parameter_norms_before_update"]
+    checks = [r for r in records if r["kind"] == "growth_check"]
+    assert checks[0]["architecture_before"] == [2, 2]
+    assert checks[0]["architecture"] == [3, 3, 2]
+    assert checks[0]["probe_ce_before"] != checks[0]["probe_ce_after"]
+    assert len({r["session_id"] for r in records}) == 1
+    assert all(a["wall_seconds"] <= b["wall_seconds"] for a, b in zip(records, records[1:]))
+    assert records[-1]["kind"] == "complete"
+    # Retain event checkpoints even when checkpoint_interval has not elapsed.
+    paths = sorted((tmp_path / "checkpoints").glob("*.pt"))
+    assert [p.name for p in paths] == ["step-000000000.pt", "step-000000002.pt", "step-000000004.pt"]
+    assert restore_checkpoint(paths[1])[0].architecture() == [3, 3, 2]
     assert model.architecture() == [4, 4, 3, 2]
     assert splits == ["train", "valid"]
     restored, _, _, saved = restore_checkpoint(tmp_path / "latest.pt")
     assert saved["step"] == 4 and restored.architecture() == model.architecture()
     with pytest.raises(ValueError, match="Run already exists"):
         trainer.train(config)
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA unavailable in CPU orb"))])
+def test_instrumented_trainer_resume_through_growth(tmp_path, monkeypatch, device):
+    trainer = importlib.import_module("growing_transformer.train")
+    monkeypatch.setattr(trainer, "load_split", lambda *_: np.arange(100, dtype=np.uint8) % 27)
+    config = TrainConfig(model=small(max_heads=4, max_layers=4), device=device,
+                         output=str(tmp_path / "continuous"), steps=5, batch_size=2,
+                         growth_interval=2, growth_warmup=2, growth_threshold=0.09,
+                         eval_batches=1, log_interval=2, checkpoint_interval=3)
+    expected = trainer.train(config)
+    source = Path(config.output) / "checkpoints" / "step-000000002.pt"
+    source_bytes = source.read_bytes()
+    config.output = str(tmp_path / "resumed")
+    actual = trainer.train(config, resume=source)
+    assert actual.architecture() == expected.architecture() == [4, 4, 3, 2]
+    tolerance = 0 if device == "cpu" else 1e-6
+    for name, value in expected.state_dict().items():
+        torch.testing.assert_close(actual.state_dict()[name], value, rtol=tolerance, atol=tolerance)
+    assert source.read_bytes() == source_bytes
+    old_records = [json.loads(s) for s in (tmp_path / "continuous" / "metrics.jsonl").read_text().splitlines()]
+    new_records = [json.loads(s) for s in (tmp_path / "resumed" / "metrics.jsonl").read_text().splitlines()]
+    assert new_records[0]["session_id"] != old_records[0]["session_id"]
+    assert new_records[0]["resume_from"] == str(source)
+    assert [r["step"] for r in new_records if r["kind"] == "train"] == [3, 4, 5]
+    assert [r["ce"] for r in new_records if r["kind"] == "train"] == pytest.approx([
+        r["ce"] for r in old_records if r["kind"] == "train" and r["step"] > 2],
+        rel=tolerance, abs=tolerance)
+    saved = torch.load(source, weights_only=True)
+    assert new_records[0]["wall_seconds"] >= saved["wall_seconds"] > 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable in CPU orb")
@@ -254,3 +311,27 @@ def test_cuda_expansion():
     x = torch.randint(27, (2, 8), device="cuda")
     language_loss(model(x), x).backward()
     optimizer.step()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable in CPU orb")
+def test_cuda_gpu_config_at_capacity():
+    config = TrainConfig(**json.loads((Path(__file__).parents[1] / "configs/gpu.json").read_text()))
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    model = GrowingTransformer(config.model, [config.model.max_heads] * config.model.max_layers).cuda()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
+    x = torch.randint(27, (config.batch_size, config.model.context), device="cuda")
+    y = (x + 1) % 27
+    started = time.perf_counter()
+    for _ in range(3):
+        optimizer.zero_grad(set_to_none=True)
+        loss = language_loss(model(x), y) + config.penalty * model.provisional_penalty()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
+        optimizer.step()
+        assert torch.isfinite(loss)
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated()
+    print(json.dumps({"capacity_probe": model.architecture(), "peak_allocated_bytes": peak,
+                      "seconds_for_three_steps": time.perf_counter() - started}))
+    assert peak < 0.8 * torch.cuda.get_device_properties(0).total_memory

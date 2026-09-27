@@ -95,16 +95,30 @@ character; attention is causal.
 Completed smoke runs already exist in the original Amp orb workspace. Choose a
 fresh `--output` directory to repeat them; the trainer refuses to overwrite an
 existing run unless resuming. Run directories contain the resolved configuration,
-JSONL metrics, and an atomic `latest.pt` checkpoint. Checkpoints store architecture,
-provisional flags, usage EMAs/ages, parameters, optimizer groups/moments, step count,
+JSONL metrics, an atomic `latest.pt` checkpoint, and retained snapshots under
+`checkpoints/` at initialization, checkpoint intervals, expansion, and completion.
+Checkpoints store architecture, provisional flags, usage EMAs/ages, parameters,
+optimizer groups/moments, step count,
 and PyTorch/batch RNG states. CPU continuation, including subsequent expansion,
 is tested for exact equality. Cross-device or cross-version bitwise equality is
 not promised.
 
 Training uses AdamW, a constant learning rate, gradient clipping, and FP32 on one
 device. There is no distributed-training or mixed-precision implementation. Logs
-record growth checks, gates, loss, parameter counts, tokens seen, and training-step
-wall time; that time excludes evaluation, checkpointing, and expansion.
+record every step's loss/BPC, accuracy, pre-clipping gradient norm, learning rates,
+architecture, parameter counts, tokens, and training time. `log_interval` controls
+console progress and detailed gate, parameter-norm, and CUDA-memory diagnostics;
+it does not downsample step records in `metrics.jsonl`. Growth checks include a
+paired before/after-expansion loss probe. Run metadata includes the code revision,
+software versions, hardware, UTC timestamps, and a unique ID for each session.
+Training-step time excludes evaluation, checkpointing, expansion, and JSON writing;
+separate wall-time and operation-duration fields capture overhead.
+
+For cluster execution, see the [tue-hpc runbook](reports/tue-hpc-runbook.md) and
+`scripts/tue-hpc.sbatch`. Use `--data` for prepared text8 on scratch and a fresh
+`--output` for every resumed allocation so interrupted attempts remain available.
+The first GPU run is exploratory: retain observations and checkpoints, defer
+interpretation, and do not alter growth settings based on whether growth occurs.
 
 ## Evaluation
 
@@ -153,6 +167,7 @@ Tests cover causality, penalty gradients, independent/simultaneous growth, warm-
 and caps, existing-weight/optimizer preservation, learning after expansion, exact
 checkpoint continuation, trainer cadence, data alignment, and evaluation accounting.
 
-For the GPU study, tune penalty strength and growth threshold on validation, run
-multiple seeds, compare fixed/adaptive models at matched token and compute budgets,
-and inspect ablation deltas before concluding that growth reflects useful capacity.
+The first GPU run records growth behavior without tuning toward a preferred result.
+Follow-up studies can vary penalty strength and growth threshold, run multiple
+seeds, and compare fixed/adaptive models at matched token and compute budgets.
+Inspect ablation deltas before concluding that growth reflects useful capacity.

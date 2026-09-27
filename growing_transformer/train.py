@@ -1,9 +1,16 @@
 import argparse
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 import json
 import math
+import os
 from pathlib import Path
+import platform
+import shutil
+import socket
+import subprocess
 import time
+import uuid
 
 import numpy as np
 import torch
@@ -102,7 +109,8 @@ def evaluate(model, data, config, *, full=False):
                                    if name != "base"}}
 
 
-def save_checkpoint(path, model, optimizer, generator, config, step, training_seconds):
+def save_checkpoint(path, model, optimizer, generator, config, step, training_seconds,
+                    wall_seconds=0.0):
     names = {id(parameter): name for name, parameter in model.named_parameters()}
     state = {
         "version": 1, "spec": model.spec(), "model": model.state_dict(),
@@ -110,6 +118,7 @@ def save_checkpoint(path, model, optimizer, generator, config, step, training_se
         "parameter_groups": [[names[id(p)] for p in group["params"]]
                              for group in optimizer.param_groups],
         "config": asdict(config), "step": step, "training_seconds": training_seconds,
+        "wall_seconds": wall_seconds,
         "batch_rng": generator.get_state(), "torch_rng": torch.get_rng_state(),
         "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
     }
@@ -140,7 +149,28 @@ def restore_checkpoint(path, device="cpu"):
     return model, optimizer, generator, state
 
 
+def runtime_metadata(device):
+    root = Path(__file__).resolve().parents[1]
+    try:
+        revision = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True, stderr=subprocess.DEVNULL).strip()
+        dirty = bool(subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=no"], cwd=root, text=True))
+    except (OSError, subprocess.CalledProcessError):
+        revision, dirty = None, None
+    result = {"revision": revision, "tracked_files_dirty": dirty,
+              "python": platform.python_version(), "numpy": np.__version__,
+              "torch": str(torch.__version__), "cuda": torch.version.cuda,
+              "hostname": socket.gethostname(), "slurm_job_id": os.environ.get("SLURM_JOB_ID")}
+    if str(device).startswith("cuda"):
+        properties = torch.cuda.get_device_properties(device)
+        result.update(gpu=properties.name, gpu_memory_bytes=properties.total_memory)
+    return result
+
+
 def train(config, resume=None):
+    session_started = time.perf_counter()
+    session_id = uuid.uuid4().hex
     torch.set_num_threads(config.threads)
     output = Path(config.output)
     output.mkdir(parents=True, exist_ok=True)
@@ -153,25 +183,50 @@ def train(config, resume=None):
     if resume:
         model, optimizer, generator, state = restore_checkpoint(resume, config.device)
         start, training_seconds = state["step"], state["training_seconds"]
+        wall_offset = state.get("wall_seconds", 0.0)
     else:
         torch.manual_seed(config.seed)
         model = GrowingTransformer(config.model).to(config.device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
         generator = torch.Generator().manual_seed(config.seed)
         start, training_seconds = 0, 0.0
+        wall_offset = 0.0
 
-    def log(record):
+    def log(record, *, console=True):
+        record = {"session_id": session_id, "timestamp": datetime.now(timezone.utc).isoformat(),
+                  "wall_seconds": wall_offset + time.perf_counter() - session_started, **record}
         with log_path.open("a") as stream:
             stream.write(json.dumps(record, allow_nan=False) + "\n")
-        print(json.dumps(record, allow_nan=False), flush=True)
+        if console:
+            print(json.dumps(record, allow_nan=False), flush=True)
 
     def validation_record(step):
+        started = time.perf_counter()
+        result = evaluate(model, validation, config)
         return {"kind": "validation", "step": step, "architecture": model.architecture(),
-                **evaluate(model, validation, config)}
+                "evaluation_seconds": time.perf_counter() - started, **result}
+
+    def checkpoint(step):
+        started = time.perf_counter()
+        path = output / "latest.pt"
+        save_checkpoint(path, model, optimizer, generator, config, step, training_seconds,
+                        wall_offset + time.perf_counter() - session_started)
+        history = output / "checkpoints"
+        history.mkdir(exist_ok=True)
+        retained = history / f"step-{step:09d}.pt"
+        temporary = retained.with_suffix(".tmp")
+        shutil.copyfile(path, temporary)
+        temporary.replace(retained)
+        log({"kind": "checkpoint", "step": step, "path": str(retained),
+             "bytes": retained.stat().st_size, "checkpoint_seconds": time.perf_counter() - started})
 
     log({"kind": "start", "resumed": bool(resume), "step": start,
-         "device": config.device, "torch": str(torch.__version__), "config": asdict(config)})
+         "resume_from": str(resume) if resume else None,
+         "device": config.device, "torch": str(torch.__version__), "config": asdict(config),
+         "environment": runtime_metadata(config.device)})
     log(validation_record(start))
+    if not resume:
+        checkpoint(start)
     model.train()
     for step in range(start + 1, config.steps + 1):
         if str(config.device).startswith("cuda"):
@@ -179,34 +234,73 @@ def train(config, resume=None):
         started = time.perf_counter()
         x, y = batch(training, config.batch_size, config.model.context, generator, config.device)
         optimizer.zero_grad(set_to_none=True)
-        ce = language_loss(model(x), y)
+        logits = model(x)
+        ce = language_loss(logits, y)
         penalty = model.provisional_penalty()
         loss = ce + config.penalty * penalty
         if not torch.isfinite(loss):
             raise FloatingPointError(f"Non-finite training loss at step {step}")
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
+        detailed = step % config.log_interval == 0 or step == config.steps
+        if detailed:
+            # Names are stable because growth only appends modules. Measure before clipping/update.
+            norms = {name: {"weight_l2": p.detach().norm().item(),
+                            "gradient_l2": p.grad.norm().item() if p.grad is not None else None}
+                     for name, p in model.named_parameters()}
+        gradient_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(), 1.0, error_if_nonfinite=True)
         optimizer.step()
         model.observe_usage(config.ema_decay)
         if str(config.device).startswith("cuda"):
             torch.cuda.synchronize()
-        training_seconds += time.perf_counter() - started
+        step_seconds = time.perf_counter() - started
+        training_seconds += step_seconds
 
+        # These losses describe this step's pre-update model, not any subsequent expansion.
+        log({"kind": "train", "step": step, "ce": ce.item(), "bpc": ce.item() / math.log(2),
+             "loss": loss.item(), "penalty_unscaled": penalty.item(),
+             "accuracy": (logits.detach().argmax(dim=-1) == y).float().mean().item(),
+             "gradient_norm_before_clip": gradient_norm.item(),
+             "learning_rates": [group["lr"] for group in optimizer.param_groups],
+             "architecture": model.architecture(),
+             "parameters": sum(p.numel() for p in model.parameters()),
+             "tokens_seen": step * config.batch_size * config.model.context,
+             "step_seconds": step_seconds, "training_seconds": training_seconds}, console=detailed)
+        if detailed:
+            memory = {}
+            if str(config.device).startswith("cuda"):
+                memory = {"allocated": torch.cuda.memory_allocated(config.device),
+                          "reserved": torch.cuda.memory_reserved(config.device),
+                          "peak_allocated": torch.cuda.max_memory_allocated(config.device),
+                          "peak_reserved": torch.cuda.max_memory_reserved(config.device)}
+            log({"kind": "diagnostics", "step": step, "usage": model.usage(),
+                 "parameter_norms_before_update": norms, "cuda_memory_bytes": memory}, console=False)
+
+        events = []
         if step % config.growth_interval == 0:
+            growth_started = time.perf_counter()
             before_usage = model.usage()
+            before_architecture = model.architecture()
+            # A paired training-batch probe measures the immediate perturbation from expansion.
+            with torch.no_grad():
+                before_ce = language_loss(model(x), y).item()
             events = model.grow(optimizer, threshold=config.growth_threshold, warmup=config.growth_warmup)
+            with torch.no_grad():
+                after_ce = language_loss(model(x), y).item() if events else before_ce
             log({"kind": "growth_check", "step": step, "events": events,
-                 "usage_before": before_usage, "architecture": model.architecture()})
-        if step % config.log_interval == 0 or step == config.steps:
-            log({"kind": "train", "step": step, "ce": ce.item(), "loss": loss.item(),
-                 "penalty_unscaled": penalty.item(), "architecture": model.architecture(),
-                 "parameters": sum(p.numel() for p in model.parameters()),
                  "tokens_seen": step * config.batch_size * config.model.context,
-                 "training_seconds": training_seconds, "usage": model.usage()})
+                 "usage_before": before_usage, "usage_after": model.usage(),
+                 "architecture_before": before_architecture, "architecture": model.architecture(),
+                 "probe_ce_before": before_ce, "probe_ce_after": after_ce,
+                 "growth_seconds": time.perf_counter() - growth_started})
         if step % config.eval_interval == 0 or step == config.steps:
             log(validation_record(step))
-        if step % config.checkpoint_interval == 0 or step == config.steps:
-            save_checkpoint(output / "latest.pt", model, optimizer, generator, config, step, training_seconds)
+        if events or step % config.checkpoint_interval == 0 or step == config.steps:
+            checkpoint(step)
+    log({"kind": "complete", "step": config.steps, "architecture": model.architecture(),
+         "parameters": sum(p.numel() for p in model.parameters()),
+         "tokens_seen": config.steps * config.batch_size * config.model.context,
+         "training_seconds": training_seconds})
     return model
 
 
@@ -216,6 +310,7 @@ def main():
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--steps", type=int, help="Total optimizer steps, including steps before resume")
     parser.add_argument("--device")
+    parser.add_argument("--data", help="Directory containing prepared text8 split files")
     parser.add_argument("--output")
     parser.add_argument("--fixed", action="store_true", help="Fixed 2-layer/2-head ungated baseline")
     parser.add_argument("--eval-only", action="store_true")
@@ -233,7 +328,7 @@ def main():
         values = saved["config"]
     else:
         values = json.loads(args.config.read_text()) if args.config else {}
-    for key in ("steps", "device", "output"):
+    for key in ("steps", "device", "data", "output"):
         if getattr(args, key) is not None:
             values[key] = getattr(args, key)
     if args.fixed:
