@@ -120,6 +120,11 @@ For cluster execution, see the [tue-hpc runbook](reports/tue-hpc-runbook.md) and
 The first GPU run is exploratory: retain observations and checkpoints, defer
 interpretation, and do not alter growth settings based on whether growth occurs.
 
+Completed experiment summaries and verified Git LFS archives live under
+[`results/`](results/README.md). The results documentation defines the repository
+layout, archive procedure, integrity checks, and retention requirements for future
+runs. Datasets, virtual environments, and caches are never archived with results.
+
 ## Evaluation
 
 ```bash
