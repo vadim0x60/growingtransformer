@@ -27,6 +27,11 @@ export MKL_NUM_THREADS=4
 unset PYTHONPATH
 
 BASE=/scratch-shared/20194474/growingtransformer
+export XDG_CACHE_HOME="$BASE/cache"
+export TORCH_HOME="$BASE/cache/torch"
+export CUDA_CACHE_PATH="$BASE/cache/cuda"
+mkdir -p "$XDG_CACHE_HOME" "$TORCH_HOME" "$CUDA_CACHE_PATH"
+# Leave TMPDIR to the cluster's job-local setup (or the node's /tmp fallback).
 PYTHON="$BASE/venv-torch260-cu118/bin/python"
 REVISION=$(git rev-parse HEAD)
 : "${EXPECTED_REVISION:?Set EXPECTED_REVISION to the approved full commit ID}"

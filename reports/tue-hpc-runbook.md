@@ -29,11 +29,10 @@ No concurrent attempts, automatic requeue, distributed training, or CPU fallback
 
 Run from the clean approved checkout on tue-hpc. Do not use the broken user-site
 torch or the older PyTorch module. Do not install packages into home. Confirm at
-least 20 GiB of scratch quota and 8 GiB of home quota remain before beginning;
-home is for archiving results, not the environment or dataset. Run `myquota`
+least 20 GiB of scratch quota remains before beginning. Run `myquota`
 to inspect both space and file quotas; require at least 50,000 free scratch file
-entries for the environment and 5,000 free home entries for results. Do not infer
-personal quota headroom from `df` filesystem totals.
+entries for the environment. Keep generated run data and caches out of home.
+Do not infer personal quota headroom from `df` filesystem totals.
 
 ```bash
 module load Umbrella/2024
@@ -50,12 +49,16 @@ PYTHON="$BASE/venv-torch260-cu118/bin/python"
 "$PYTHON" -m pip install --no-deps -e .
 "$PYTHON" -m pip check
 "$PYTHON" -m growing_transformer.data --directory "$BASE/data/text8"
+# Do not export the login-node setup temp path into a batch allocation.
+unset TMPDIR
 ```
 
 The CUDA 11.8 wheel supports V100; actual driver/device operation must pass the
 job's preflight. Record the resolved environment with `pip freeze` (the job does
 this). Avoid package upgrades between attempts. The code has been CPU-tested
 with PyTorch 2.6.0, NumPy 2.2.6, and pytest 8.3.5; that is not GPU verification.
+The batch script routes model/CUDA caches to scratch and leaves temporary files
+to the cluster's job-local `$TMPDIR` (or node-local `/tmp` if unset).
 
 ## Submit once, after the handoff
 
@@ -146,7 +149,7 @@ Check after startup, at the first validation/checkpoint, and at least every
 | Failed/skipped GPU test, wrong device/build, non-finite loss/gradient, OOM, corrupted data/checkpoint, write failure | Stop/hold. Preserve logs. Report to the designer; do not change batch size, precision, LR, gates, or caps to make it continue. |
 | No metrics progress for 15 minutes while Slurm says RUNNING | Inspect Slurm state, process/GPU activity, and whether evaluation/checkpointing is active. If still stalled at a second check five minutes later, cancel and report; do not launch a duplicate. |
 | Peak GPU allocated memory above 90%, sustained step time above 5× the preceding 1,000-step median, or validation BPC >1 bit above the prior evaluation | Report and investigate, but do not stop or tune solely for these observations. Growth can change timing and quality. |
-| Scratch quota headroom below 10 GiB, or durable archive no longer fits home quota | Cancel before storage exhaustion, preserve existing artifacts, and resolve storage before resuming. Do not delete retained checkpoints. |
+| Scratch quota headroom below 10 GiB | Cancel before storage exhaustion, preserve existing artifacts, and resolve storage before resuming. Do not delete retained checkpoints. |
 | No growth, saturated caps, tiny gates, or worse validation | Record; continue within budget. These are not operational failures. |
 | Step 100,000 or total allocated budget exhausted | End training. If budget expires first, label it a budget-limited partial run, not a completed 100,000-step run. |
 
@@ -200,12 +203,16 @@ whose saved training configuration differs from `configs/gpu.json` (except paths
 
 ## Archive before scratch expiry
 
-Scratch expires after 14 days. After each allocation ends, copy the entire run
-directory (metrics, all retained checkpoints, logs, resolved environment and
-validation) to
-`/vast.mnt/home/20194474/growingtransformer-results/<revision>/adaptive-seed42/`.
-Exclude incomplete `*.tmp` files. Verify the copy with checksums before declaring
-the handoff finished. Keep the source until verification; do not copy the venv,
-pip cache, or dataset to home. Report final architecture, achieved step/token
-count, validation BPC, allocated GPU-hours, job IDs, and durable artifact path,
-without making a claim that growth succeeded or failed scientifically.
+Scratch expires after 14 days. Cleanup guidance requires keeping large/generated
+outputs out of home, so do not automatically copy results there. At run completion,
+report the run-directory size and earliest scratch expiry, identify available
+durable project storage, and request approval of the archive destination. If no
+durable destination is available, report that as an outstanding retention blocker;
+do not describe scratch-only results as durably archived.
+
+Preserve the entire run directory (metrics, all retained checkpoints, logs,
+resolved environment and validation) until transfer. Exclude incomplete `*.tmp`
+files from the archive and verify it with checksums before deleting any source.
+Do not archive the venv, pip cache, or dataset. Report final architecture,
+achieved step/token count, validation BPC, allocated GPU-hours, job IDs, artifact
+path and retention status, without declaring scientific success or failure.
